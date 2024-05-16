@@ -5,6 +5,8 @@
 #include <string>
 
 using std::string;
+using std::min;
+using std::max;
 
 typedef uint8_t u8;
 typedef uint16_t u16;
@@ -48,11 +50,12 @@ struct fat32_dir_entry {
 
 #define ATTRS_LFN       0x0f
 
-#define CLUSTER_NUM(x) (x & ((1 << 28) - 1))
+#define CLUSTER_NUM(x)  (x & ((1 << 28) - 1))
 
 #define RECORD_UNUSED   '\xe5'
 
 #define LAST_CLUSTER    0xffffffff
+#define IS_EOC(cluster) (cluster >= 0x0FFFFFF8)
 
 // VFAT long filename support
 // https://en.wikipedia.org/wiki/Design_of_the_FAT_file_system#VFAT
@@ -67,11 +70,6 @@ void fatal(const char *msg)
     exit(1);
 }
 
-u32 cluster_lba(u32 cluster_begin_lba, u32 sectors_per_cluster, u32 cluster_number)
-{
-    return cluster_begin_lba + (cluster_number - 2) * sectors_per_cluster;
-}
-
 // string read_fat32_cluster_chain(FILE *dev, int first_cluster, )
 
 void short2long_fname(const char filename[11], char *result)
@@ -80,16 +78,17 @@ void short2long_fname(const char filename[11], char *result)
 }
 
 struct fat32_consts {
-
+    u32 fat_begin_lba;
+    u32 cluster_begin_lba;
+    u32 sectors_per_cluster;
+    u32 root_dir_first_cluster;
 };
 
-string read_fat32_file(FILE *dev, int start_lba, const string &path)
+struct fat32_consts read_fat32_volume_id(FILE *dev, int start_lba)
 {
-    int res;
+    struct fat32_consts c;
     fat32_volume_id vid;
-
-    char long_name[256 * 2] = {0};
-    bool in_long_name = false;
+    int res;
 
     fseek(dev, start_lba * BLOCK_SIZE, SEEK_SET);
 
@@ -112,14 +111,79 @@ string read_fat32_file(FILE *dev, int start_lba, const string &path)
     assert(vid.bytes_per_sec == 512);
     assert(vid.num_fats == 2);
 
-    u32 fat_begin_lba = start_lba + vid.rsvd_sec_cnt;
-    u32 cluster_begin_lba = start_lba + vid.rsvd_sec_cnt + (vid.num_fats * vid.sc_per_fat);
-    u32 sectors_per_cluster = vid.sc_per_clus;
-    u32 root_dir_first_cluster = vid.root_clus;
+    c.fat_begin_lba = start_lba + vid.rsvd_sec_cnt;
+    c.cluster_begin_lba = start_lba + vid.rsvd_sec_cnt + vid.num_fats * vid.sc_per_fat;
+    c.sectors_per_cluster = vid.sc_per_clus;
+    c.root_dir_first_cluster = vid.root_clus;
 
-    printf("Custer start: %#x\n", cluster_begin_lba);
+    return c;
+}
 
-    fseek(dev, cluster_begin_lba * BLOCK_SIZE, SEEK_SET);
+u32 cluster_lba(const fat32_consts &c, u32 cluster)
+{
+    return c.cluster_begin_lba + (cluster - 2) * c.sectors_per_cluster;
+}
+
+u32 cluster_read_next(FILE *dev, const fat32_consts &c, u32 cluster)
+{
+    u32 next;
+    int res;
+
+    fseek(dev, c.fat_begin_lba * BLOCK_SIZE + cluster * sizeof(next), SEEK_SET);
+    res = fread(&next, sizeof(next), 1, dev);
+    if (res != 1)
+        fatal("fread");
+    return CLUSTER_NUM(next);
+}
+
+void read_in_cluster(string &target, FILE *dev, u32 size)
+{
+    static char block[BLOCK_SIZE];
+
+    int res;
+
+    while (size > 0) {
+        u32 read_size = min(size, (u32)BLOCK_SIZE);
+
+        res = fread(block, read_size, 1, dev);
+        if (res != 1)
+            fatal("fread");
+        target.append(block, read_size);
+        size -= read_size;
+    }
+}
+
+string read_fat32_file(FILE *dev, const struct fat32_consts &c, u32 cluster, u32 size)
+{
+    u32 cluster_size = c.sectors_per_cluster * BLOCK_SIZE;
+    string file;
+    int res;
+
+    file.reserve(size);
+
+    while (size > 0) {
+        u32 read_size = min(size, cluster_size);
+        fseek(dev, cluster_lba(c, cluster) * BLOCK_SIZE, SEEK_SET);
+        read_in_cluster(file, dev, read_size);
+
+        size -= read_size;
+        if (size > 0) {
+            cluster = cluster_read_next(dev, c, cluster);
+            if (IS_EOC(cluster))
+                fatal("reading past EOC");
+        }
+    }
+
+    return file;
+}
+
+string read_fat32_dir(FILE *dev, const struct fat32_consts &c)
+{
+    char long_name[256 * 2] = {0};
+    bool in_long_name = false;
+    int res;
+
+    fseek(dev, c.cluster_begin_lba * BLOCK_SIZE, SEEK_SET);
 
     while (true) {
         fat32_dir_entry ent;
@@ -149,7 +213,7 @@ string read_fat32_file(FILE *dev, int start_lba, const string &path)
         if ((ent.attr & ATTR_VOLUME_ID) == 0) {
             if (in_long_name) {
                 // TODO: Handle non-ASCII
-                char ascii_name[14];
+                char ascii_name[256];
                 int i;
                 for (i = 0; long_name[i * 2]; i++)
                     ascii_name[i] = long_name[i * 2];
@@ -161,7 +225,9 @@ string read_fat32_file(FILE *dev, int start_lba, const string &path)
             }
 
             string name(ent.name, 11);
-            printf("short name: %s\n\n", name.c_str());
+            printf("short name: %s\n", name.c_str());
+            printf("cluster: %d\n", ent.cluster_low + (ent.cluster_high << 16));
+            printf("size: %d\n\n", ent.file_size);
         }
     }
 
@@ -179,7 +245,10 @@ int main(int argc, char *argv[])
     if (!dev)
         fatal("fopen");
 
-    read_fat32_file(dev, 0x800, "/");
+    fat32_consts c = read_fat32_volume_id(dev, 0x800);
+    read_fat32_dir(dev, c);
+    string f = read_fat32_file(dev, c, 54, 508894);
+    printf("file: %s\n", f.c_str());
 
     return 0;
 }
