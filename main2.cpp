@@ -51,6 +51,7 @@ struct fat32_dir_entry {
 #define ATTRS_LFN       0x0f
 
 #define CLUSTER_NUM(x)  (x & ((1 << 28) - 1))
+#define ENT_CLUSTER(ent)(ent.cluster_low + (ent.cluster_high << 16))
 
 #define RECORD_UNUSED   '\xe5'
 
@@ -97,9 +98,9 @@ struct fat32_consts read_fat32_volume_id(FILE *dev, int start_lba)
         fatal("fread");
     if (vid.signature != 0xaa55)
         fatal("invalid MBR signature");
-    
+
     printf("---------- FAT ----------\n");
-    
+
     printf("bytes_per_sec: %#x\n", vid.bytes_per_sec);
     printf("sc_per_clus: %#x\n", vid.sc_per_clus);
     printf("rsvd_sec_cnt: %#x\n", vid.rsvd_sec_cnt);
@@ -157,7 +158,7 @@ bool fat32_read_aligned(FILE *dev, const fat32_consts &c, void *buffer, u32 size
     res = fread(buffer, size, 1, dev);
     if (res != 1)
         fatal("fread");
-    
+
     if (cluster_offset + size == cluster_size) {
         printf("Going to next cluster from %d", cluster);
         cluster = cluster_read_next(dev, c, cluster);
@@ -169,7 +170,7 @@ bool fat32_read_aligned(FILE *dev, const fat32_consts &c, void *buffer, u32 size
     return true;
 }
 
-string read_fat32_file_2(FILE *dev, const struct fat32_consts &c, u32 cluster, u32 size)
+string read_fat32_file(FILE *dev, const struct fat32_consts &c, u32 cluster, u32 size)
 {
     static char block[BLOCK_SIZE];
     string file;
@@ -186,26 +187,6 @@ string read_fat32_file_2(FILE *dev, const struct fat32_consts &c, u32 cluster, u
 
     return file;
 }
-
-// string read_fat32_file(FILE *dev, const struct fat32_consts &c, const char *path)
-// {
-//     const char *sep = NULL;
-//     char dirname[256];
-
-//     sep = strcasestr(path, "/");
-
-//     while (sep) {
-//         int dirlen = sep - path;
-//         memcpy(dirname, path, dirlen);
-//         dirname[dirlen] = 0;
-
-//         path = sep + 1;
-//     }
-
-//     int cluster = 555;
-//     int size = 555;
-//     // return read_fat32_file(dev, c, cluster, size);
-// }
 
 bool read_fat32_dir_ent(FILE *dev, const struct fat32_consts &c, fat32_dir_entry *ent, char *long_name)
 {
@@ -241,7 +222,7 @@ bool read_fat32_dir_ent(FILE *dev, const struct fat32_consts &c, fat32_dir_entry
     }
 }
 
-void print_fat32_dir(FILE *dev, const struct fat32_consts &c)
+void print_fat32_root_dir(FILE *dev, const struct fat32_consts &c)
 {
     char long_name[256 * 2];
     fat32_dir_entry ent;
@@ -266,6 +247,67 @@ void print_fat32_dir(FILE *dev, const struct fat32_consts &c)
     }
 }
 
+bool dirent_name_matches(const fat32_dir_entry *ent, const char *long_name, const char *target_name)
+{
+    // TODO: Look at short name too
+    // TODO: Handle non-ASCII
+    char ascii_name[256];
+    int i;
+    for (i = 0; long_name[i * 2]; i++)
+        ascii_name[i] = long_name[i * 2];
+    ascii_name[i] = 0;
+    return strcmp(target_name, ascii_name) == 0;
+}
+
+string read_fat32_file(FILE *dev, const struct fat32_consts &c, const char *_path)
+{
+    char path_copy[256];
+    char *path;
+    char *sep = NULL;
+
+    char long_name[256 * 2];
+    fat32_dir_entry ent;
+
+    assert(strlen(_path) + 1 <= sizeof(path_copy));
+    strcpy(path_copy, _path);
+    path = path_copy;
+
+    // Seek to root dir
+    fseek(dev, c.cluster_begin_lba * BLOCK_SIZE, SEEK_SET);
+
+    while (true) {
+        sep = strcasestr(path, "/");
+        if (sep)
+            *sep = 0;
+
+        printf("searching for %s\n", path);
+
+        u32 next_cluster = 0;
+
+        while (read_fat32_dir_ent(dev, c, &ent, long_name)) {
+            if (dirent_name_matches(&ent, long_name, path)) {
+                next_cluster = ENT_CLUSTER(ent);
+                break;
+            }
+        }
+
+        if (!next_cluster) {
+            printf("Could not find directory named %s\n", path);
+            fatal("Traversal error");
+        }
+        if (!!sep != !!(ent.attr & ATTR_DIRECTORY))
+            fatal("wrong file type");
+
+        fseek(dev, cluster2addr(c, next_cluster), SEEK_SET);
+
+        if (!sep)
+            break;
+        path = sep + 1;
+    }
+
+    return read_fat32_file(dev, c, ENT_CLUSTER(ent), ent.file_size);
+}
+
 int main(int argc, char *argv[])
 {
     if (argc != 2) {
@@ -278,9 +320,10 @@ int main(int argc, char *argv[])
         fatal("fopen");
 
     fat32_consts c = read_fat32_volume_id(dev, 0x800);
-    print_fat32_dir(dev, c);
+    print_fat32_root_dir(dev, c);
+    string f = read_fat32_file(dev, c, "dir1/dir2/file");
     // string f = read_fat32_file_2(dev, c, 54, 508894);
-    // printf("file: %s\n", f.c_str());
+    printf("file: %s\n", f.c_str());
 
     return 0;
 }
