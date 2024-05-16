@@ -119,9 +119,14 @@ struct fat32_consts read_fat32_volume_id(FILE *dev, int start_lba)
     return c;
 }
 
-u32 cluster_lba(const fat32_consts &c, u32 cluster)
+u32 cluster2addr(const fat32_consts &c, u32 cluster)
 {
-    return c.cluster_begin_lba + (cluster - 2) * c.sectors_per_cluster;
+    return (c.cluster_begin_lba + (cluster - 2) * c.sectors_per_cluster) * BLOCK_SIZE;
+}
+
+u32 addr2cluster(const fat32_consts &c, u32 addr)
+{
+    return (addr / BLOCK_SIZE - c.cluster_begin_lba) / c.sectors_per_cluster + 2;
 }
 
 u32 cluster_read_next(FILE *dev, const fat32_consts &c, u32 cluster)
@@ -136,102 +141,129 @@ u32 cluster_read_next(FILE *dev, const fat32_consts &c, u32 cluster)
     return CLUSTER_NUM(next);
 }
 
-void read_in_cluster(string &target, FILE *dev, u32 size)
+// Read from data cluster, and switch to next cluster if we finish reading this one
+
+bool fat32_read_aligned(FILE *dev, const fat32_consts &c, void *buffer, u32 size)
+{
+    long addr = ftell(dev);
+    u32 cluster_size = c.sectors_per_cluster * BLOCK_SIZE;
+    u32 cluster = addr2cluster(c, addr);
+    u32 cluster_offset = addr - cluster2addr(c, cluster);
+    int res;
+
+    if (cluster_offset + size > cluster_size)
+        fatal("read crossing sector boundary");
+
+    res = fread(buffer, size, 1, dev);
+    if (res != 1)
+        fatal("fread");
+    
+    if (cluster_offset + size == cluster_size) {
+        printf("Going to next cluster from %d", cluster);
+        cluster = cluster_read_next(dev, c, cluster);
+        printf("to %d\n", cluster);
+        if (IS_EOC(cluster))
+            return false;
+        fseek(dev, cluster2addr(c, cluster), SEEK_SET);
+    }
+    return true;
+}
+
+string read_fat32_file_2(FILE *dev, const struct fat32_consts &c, u32 cluster, u32 size)
 {
     static char block[BLOCK_SIZE];
+    string file;
 
-    int res;
+    file.reserve(size);
+    fseek(dev, cluster2addr(c, cluster), SEEK_SET);
 
     while (size > 0) {
         u32 read_size = min(size, (u32)BLOCK_SIZE);
-
-        res = fread(block, read_size, 1, dev);
-        if (res != 1)
-            fatal("fread");
-        target.append(block, read_size);
+        fat32_read_aligned(dev, c, block, read_size);
+        file.append(block, read_size);
         size -= read_size;
-    }
-}
-
-string read_fat32_file(FILE *dev, const struct fat32_consts &c, u32 cluster, u32 size)
-{
-    u32 cluster_size = c.sectors_per_cluster * BLOCK_SIZE;
-    string file;
-    int res;
-
-    file.reserve(size);
-
-    while (size > 0) {
-        u32 read_size = min(size, cluster_size);
-        fseek(dev, cluster_lba(c, cluster) * BLOCK_SIZE, SEEK_SET);
-        read_in_cluster(file, dev, read_size);
-
-        size -= read_size;
-        if (size > 0) {
-            cluster = cluster_read_next(dev, c, cluster);
-            if (IS_EOC(cluster))
-                fatal("reading past EOC");
-        }
     }
 
     return file;
 }
 
-string read_fat32_dir(FILE *dev, const struct fat32_consts &c)
-{
-    char long_name[256 * 2] = {0};
-    bool in_long_name = false;
-    int res;
+// string read_fat32_file(FILE *dev, const struct fat32_consts &c, const char *path)
+// {
+//     const char *sep = NULL;
+//     char dirname[256];
 
-    fseek(dev, c.cluster_begin_lba * BLOCK_SIZE, SEEK_SET);
+//     sep = strcasestr(path, "/");
+
+//     while (sep) {
+//         int dirlen = sep - path;
+//         memcpy(dirname, path, dirlen);
+//         dirname[dirlen] = 0;
+
+//         path = sep + 1;
+//     }
+
+//     int cluster = 555;
+//     int size = 555;
+//     // return read_fat32_file(dev, c, cluster, size);
+// }
+
+bool read_fat32_dir_ent(FILE *dev, const struct fat32_consts &c, fat32_dir_entry *ent, char *long_name)
+{
+    bool in_long_name = false;
+    bool res;
+
+    long_name[0] = 0;
 
     while (true) {
-        fat32_dir_entry ent;
-        res = fread(&ent, sizeof(ent), 1, dev);
-        if (res != 1)
-            fatal("fread");
+        // TODO: Verify we don't read if no more data is left
+        fat32_read_aligned(dev, c, ent, sizeof(*ent));
 
-        if (ent.name[0] == 0)
-            break;
-        if (ent.name[0] == RECORD_UNUSED)
+        if (ent->name[0] == 0)
+            return false;
+        if (ent->name[0] == RECORD_UNUSED)
             continue;
-
-        if (ent.attr == ATTRS_LFN) {
+        if (ent->attr == ATTRS_LFN) {
             char name_part[LFN_ENTRY_CHARS];
-            char *ent_bytes = (char*)&ent;
+            char *ent_bytes = (char*)ent;
 
             memcpy(name_part +  0, ent_bytes + 0x01, 10);
             memcpy(name_part + 10, ent_bytes + 0x0e, 12);
             memcpy(name_part + 22, ent_bytes + 0x1c, 4);
 
-            int seq = ent.name[0] & LFN_ENTRY_SEQ_MASK;
+            int seq = ent->name[0] & LFN_ENTRY_SEQ_MASK;
             memcpy(long_name + (seq - 1) * LFN_ENTRY_CHARS, name_part, LFN_ENTRY_CHARS);
 
             in_long_name = true;
+            continue;
         }
 
-        if ((ent.attr & ATTR_VOLUME_ID) == 0) {
-            if (in_long_name) {
-                // TODO: Handle non-ASCII
-                char ascii_name[256];
-                int i;
-                for (i = 0; long_name[i * 2]; i++)
-                    ascii_name[i] = long_name[i * 2];
-                ascii_name[i] = 0;
-                printf("long name: %s\n", ascii_name);
-
-                in_long_name = false;
-                memset(long_name, 0, sizeof(long_name));
-            }
-
-            string name(ent.name, 11);
-            printf("short name: %s\n", name.c_str());
-            printf("cluster: %d\n", ent.cluster_low + (ent.cluster_high << 16));
-            printf("size: %d\n\n", ent.file_size);
-        }
+        return true;
     }
+}
 
-    return "";
+void print_fat32_dir(FILE *dev, const struct fat32_consts &c)
+{
+    char long_name[256 * 2];
+    fat32_dir_entry ent;
+
+    fseek(dev, c.cluster_begin_lba * BLOCK_SIZE, SEEK_SET);
+
+    while (read_fat32_dir_ent(dev, c, &ent, long_name)) {
+        if (long_name[0]) {
+            // TODO: Handle non-ASCII
+            char ascii_name[256];
+            int i;
+            for (i = 0; long_name[i * 2]; i++)
+                ascii_name[i] = long_name[i * 2];
+            ascii_name[i] = 0;
+            printf("long name: %s\n", ascii_name);
+        }
+
+        string name(ent.name, 11);
+        printf("short name: %s\n", name.c_str());
+        printf("cluster: %d\n", ent.cluster_low + (ent.cluster_high << 16));
+        printf("size: %d\n\n", ent.file_size);
+    }
 }
 
 int main(int argc, char *argv[])
@@ -246,9 +278,9 @@ int main(int argc, char *argv[])
         fatal("fopen");
 
     fat32_consts c = read_fat32_volume_id(dev, 0x800);
-    read_fat32_dir(dev, c);
-    string f = read_fat32_file(dev, c, 54, 508894);
-    printf("file: %s\n", f.c_str());
+    print_fat32_dir(dev, c);
+    // string f = read_fat32_file_2(dev, c, 54, 508894);
+    // printf("file: %s\n", f.c_str());
 
     return 0;
 }
