@@ -9,8 +9,6 @@ typedef uint16_t u16;
 typedef uint32_t u32;
 typedef uint64_t u64;
 
-#define BLOCK_SIZE 512
-
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 void fatal(const char *msg)
@@ -22,6 +20,8 @@ void fatal(const char *msg)
 // ====================
 // MBR Partition Parsing
 // ====================
+
+#define BLOCK_SIZE 512
 
 /*
 Offset	Size (bytes)	Description
@@ -90,6 +90,7 @@ void read_mbr(FILE *dev, mbr *m)
 // ====================
 
 // https://www.pjrc.com/tech/8051/ide/fat32.html
+// https://www.cs.fsu.edu/~cop4610t/assignments/project3/spec/fatspec.pdf
 
 struct fat32_volume_id {
     u8 _padding1[0xb];
@@ -105,7 +106,8 @@ struct fat32_volume_id {
     u16 signature;
 } __attribute__((packed));
 
-#define SHORTNAME_LEN 11
+#define SHORTNAME_LEN 11 // Excluding . and NULL terminator
+#define LONGNAME_MAX_LEN 256 // Including NULL terminator
 
 struct fat32_dir_entry {
     char name[SHORTNAME_LEN];
@@ -138,20 +140,39 @@ struct fat32_dir_entry {
 
 #define LFN_ENTRY_LAST      0x40
 #define LFN_ENTRY_SEQ_MASK  0x1f
-#define LFN_ENTRY_CHARS     26
+#define LFN_ENTRY_CHARS     13
 
-void shortname2longname(const char filename[SHORTNAME_LEN], char *result)
+char *shortname_expand(const char filename[SHORTNAME_LEN])
 {
+    static char buffer[SHORTNAME_LEN + 2];
+    char *p = buffer;
+
     for (int i = 0; i < SHORTNAME_LEN; i++) {
         if (filename[i] == ' ')
             continue;
         
         if (i == 8)
-            *(result++) = '.';
+            *(p++) = '.';
 
-        *(result++) = filename[i];
+        *(p++) = filename[i];
     }
-    *(result++) = 0;
+    *(p++) = 0;
+    return buffer;
+}
+
+char *longname2ascii(u16 *longname)
+{
+    static char buffer[LONGNAME_MAX_LEN];
+    char *p = buffer;
+
+    for (; *longname; longname++) {
+        if (*longname > 0x7f)
+            *(p++) = '?';
+        else
+            *(p++) = *longname;
+    }
+    *(p++) = 0;
+    return buffer;
 }
 
 u32 fat32_cluster(struct fat32_dir_entry *ent)
@@ -166,7 +187,7 @@ struct fat32_consts {
     u32 root_dir_first_cluster;
 };
 
-struct fat32_consts read_fat32_volume_id(FILE *dev, int start_lba)
+struct fat32_consts fat32_read_volume_id(FILE *dev, int start_lba)
 {
     struct fat32_consts c;
     fat32_volume_id vid;
@@ -241,7 +262,7 @@ bool fat32_read_aligned(FILE *dev, fat32_consts *c, void *buffer, u32 size)
 
 void fat32_print_file(FILE *dev, struct fat32_consts *c, u32 cluster, u32 size)
 {
-    static char block[BLOCK_SIZE];
+    char block[BLOCK_SIZE];
 
     fseek(dev, cluster2addr(c, cluster), SEEK_SET);
 
@@ -258,20 +279,23 @@ void fat32_print_file(FILE *dev, struct fat32_consts *c, struct fat32_dir_entry 
     fat32_print_file(dev, c, fat32_cluster(ent), ent->file_size);
 }
 
-bool fat32_read_dir_ent(FILE *dev, struct fat32_consts *c, fat32_dir_entry *ent, char *long_name)
+bool fat32_read_dir_ent(FILE *dev, struct fat32_consts *c, fat32_dir_entry *ent, u16 *long_name)
 {
     long_name[0] = 0;
+    bool more_data = true;
 
     while (true) {
-        // TODO: Verify we don't read if no more data is left
-        fat32_read_aligned(dev, c, ent, sizeof(*ent));
+        if (!more_data)
+            fatal("Unterminated directory");
+
+        more_data = fat32_read_aligned(dev, c, ent, sizeof(*ent));
 
         if (ent->name[0] == 0)
             return false;
         if (ent->name[0] == RECORD_UNUSED)
             continue;
         if (ent->attr == ATTRS_LFN) {
-            char name_part[LFN_ENTRY_CHARS];
+            char name_part[LFN_ENTRY_CHARS * 2];
             char *ent_bytes = (char*)ent;
 
             memcpy(name_part +  0, ent_bytes + 0x01, 10);
@@ -279,7 +303,7 @@ bool fat32_read_dir_ent(FILE *dev, struct fat32_consts *c, fat32_dir_entry *ent,
             memcpy(name_part + 22, ent_bytes + 0x1c, 4);
 
             int seq = ent->name[0] & LFN_ENTRY_SEQ_MASK;
-            memcpy(long_name + (seq - 1) * LFN_ENTRY_CHARS, name_part, LFN_ENTRY_CHARS);
+            memcpy(long_name + (seq - 1) * LFN_ENTRY_CHARS, name_part, LFN_ENTRY_CHARS * 2);
             // Last entry might be unterminated
             if (ent->name[0] & LFN_ENTRY_LAST)
                 long_name[seq * LFN_ENTRY_CHARS] = 0;
@@ -294,62 +318,45 @@ bool fat32_read_dir_ent(FILE *dev, struct fat32_consts *c, fat32_dir_entry *ent,
 void fat32_list_dir(FILE *dev, struct fat32_consts *c, struct fat32_dir_entry *dir_ent)
 {
     struct fat32_dir_entry ent;
-    char long_name[256 * 2];
+    u16 long_name[LONGNAME_MAX_LEN];
+
+    printf("dirents in cluster %d\n", c->sectors_per_cluster * BLOCK_SIZE / 0x20);
 
     fseek(dev, cluster2addr(c, fat32_cluster(dir_ent)), SEEK_SET);
 
     while (fat32_read_dir_ent(dev, c, &ent, long_name)) {
-        char shortname[SHORTNAME_LEN + 2];
-
-        shortname2longname(ent.name, shortname);
-
         printf("%c%c%c%c%c %10d %10d %-12s",
             ent.attr & ATTR_HIDDEN     ? 'H' : '-',
             ent.attr & ATTR_SYSTEM     ? 'S' : '-',
             ent.attr & ATTR_VOLUME_ID  ? 'V' : '-',
             ent.attr & ATTR_DIRECTORY  ? 'D' : '-',
             ent.attr & ATTR_ARCHIVE    ? 'A' : '-',
-            fat32_cluster(&ent), ent.file_size, shortname);
+            fat32_cluster(&ent), ent.file_size,
+            shortname_expand(ent.name));
 
         if (long_name[0]) {
-            // TODO: Handle non-ASCII
-            char ascii_name[256];
-            int i;
-            for (i = 0; long_name[i * 2]; i++) {
-                ascii_name[i] = long_name[i * 2];
-            }
-            ascii_name[i] = 0;
-            printf(" %s", ascii_name);
+            printf(" %s", longname2ascii(long_name));
         }
 
         printf("\n");
     }
 }
 
-bool fat32_dirent_name_matches(const fat32_dir_entry *ent, const char *long_name, const char *target_name)
+bool fat32_dirent_name_matches(fat32_dir_entry *ent, u16 *long_name, const char *target_name)
 {
-    // TODO: Handle non-ASCII
-    char ascii_name[256];
-    char shortname[SHORTNAME_LEN + 2];
-    int i;
-
-    shortname2longname(ent->name, shortname);
-    if (!strcasecmp(shortname, target_name))
+    if (!strcasecmp(shortname_expand(ent->name), target_name))
         return true;
 
-    for (i = 0; long_name[i * 2]; i++)
-        ascii_name[i] = long_name[i * 2];
-    ascii_name[i] = 0;
-    return strcasecmp(target_name, ascii_name) == 0;
+    return strcasecmp(longname2ascii(long_name), target_name) == 0;
 }
 
 void fat32_follow_path(FILE *dev, struct fat32_consts *c, const char *_path, fat32_dir_entry *ent)
 {
-    char path_copy[256];
+    char path_copy[LONGNAME_MAX_LEN];
     char *path;
     char *sep = NULL;
 
-    char long_name[256 * 2];
+    u16 long_name[LONGNAME_MAX_LEN];
 
     assert(strlen(_path) + 1 <= sizeof(path_copy));
     strcpy(path_copy, _path);
@@ -385,11 +392,11 @@ void fat32_follow_path(FILE *dev, struct fat32_consts *c, const char *_path, fat
         }
 
         if (!next_cluster) {
-            fprintf(stderr, "could not find file/directory named '%s'\n", path);
+            fprintf(stderr, "could not find file/directory named '%s'\n", path_copy);
             fatal("path not found: no such file or directory");
         }
         if (sep && !(ent->attr & ATTR_DIRECTORY)) {
-            fprintf(stderr, "cannot access '%s'\n", path);
+            fprintf(stderr, "cannot access '%s'\n", path_copy);
             fatal("path not found: not a directory");
         }
 
@@ -398,6 +405,7 @@ void fat32_follow_path(FILE *dev, struct fat32_consts *c, const char *_path, fat
         if (!sep)
             break;
         path = sep + 1;
+        *sep = '/';
     }
 }
 
@@ -460,7 +468,7 @@ int main(int argc, char *argv[])
 
     // Read FAT32
 
-    c = read_fat32_volume_id(dev, m.mbr_partitions[part_id].part_lba_start);
+    c = fat32_read_volume_id(dev, m.mbr_partitions[part_id].part_lba_start);
 
     if (argc < 4) {
         path = "/";
