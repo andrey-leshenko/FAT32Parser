@@ -9,7 +9,7 @@ Be sure to run as root to be able to read the raw device.
 
 ```
 $ make
-g++ main.cpp -g -Wall -o main
+gcc main.c -g -Wall -o main
 
 $ ./main
 usage: ./main DEV [PART [PATH]]
@@ -61,4 +61,11 @@ dirents in cluster 128
 $ ./main /dev/sda 0 dir1/dir2/file
 I am a simple text file!
 $ 
+```
+
+## Useful manual commands
+
+```sh
+sudo xxd /dev/sda | less
+sudo dd if=/dev/sda of=/dev/stdout bs=512 skip=$((0x800)) count=1 | xxd
 ```

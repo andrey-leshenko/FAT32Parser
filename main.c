@@ -3,6 +3,7 @@
 #include <string.h>
 #include <assert.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 typedef uint8_t u8;
 typedef uint16_t u16;
@@ -58,7 +59,7 @@ struct mbr {
     u8 mbr_bootstrap[0x1b8];
     u32 mbr_uid;
     u16 mbr_reserved_1bc;
-    partition mbr_partitions[4];
+    struct partition mbr_partitions[4];
     u16 mbr_signature;
 } __attribute__((packed));
 
@@ -73,7 +74,7 @@ bool is_fat32_sysid(int sysid)
     return sysid == PART_FAT32_CHS || sysid == PART_FAT32_LBA;
 }
 
-void read_mbr(FILE *dev, mbr *m)
+void read_mbr(FILE *dev, struct mbr *m)
 {
     int res;
 
@@ -190,7 +191,7 @@ struct fat32_consts {
 struct fat32_consts fat32_read_volume_id(FILE *dev, int start_lba)
 {
     struct fat32_consts c;
-    fat32_volume_id vid;
+    struct fat32_volume_id vid;
     int res;
 
     fseek(dev, start_lba * BLOCK_SIZE, SEEK_SET);
@@ -212,17 +213,17 @@ struct fat32_consts fat32_read_volume_id(FILE *dev, int start_lba)
     return c;
 }
 
-u32 cluster2addr(fat32_consts *c, u32 cluster)
+u32 cluster2addr(struct fat32_consts *c, u32 cluster)
 {
     return (c->cluster_begin_lba + (cluster - 2) * c->sectors_per_cluster) * BLOCK_SIZE;
 }
 
-u32 addr2cluster(fat32_consts *c, u32 addr)
+u32 addr2cluster(struct fat32_consts *c, u32 addr)
 {
     return (addr / BLOCK_SIZE - c->cluster_begin_lba) / c->sectors_per_cluster + 2;
 }
 
-u32 cluster_read_next(FILE *dev, fat32_consts *c, u32 cluster)
+u32 cluster_read_next(FILE *dev, struct fat32_consts *c, u32 cluster)
 {
     u32 next;
     int res;
@@ -236,7 +237,7 @@ u32 cluster_read_next(FILE *dev, fat32_consts *c, u32 cluster)
 
 // Read from data cluster, and switch to next cluster if we finish reading this one
 
-bool fat32_read_aligned(FILE *dev, fat32_consts *c, void *buffer, u32 size)
+bool fat32_read_aligned(FILE *dev, struct fat32_consts *c, void *buffer, u32 size)
 {
     long addr = ftell(dev);
     u32 cluster_size = c->sectors_per_cluster * BLOCK_SIZE;
@@ -274,12 +275,12 @@ void fat32_print_file(FILE *dev, struct fat32_consts *c, u32 cluster, u32 size)
     }
 }
 
-void fat32_print_file(FILE *dev, struct fat32_consts *c, struct fat32_dir_entry *ent)
+void fat32_print_file_ent(FILE *dev, struct fat32_consts *c, struct fat32_dir_entry *ent)
 {
     fat32_print_file(dev, c, fat32_cluster(ent), ent->file_size);
 }
 
-bool fat32_read_dir_ent(FILE *dev, struct fat32_consts *c, fat32_dir_entry *ent, u16 *long_name)
+bool fat32_read_dir_ent(FILE *dev, struct fat32_consts *c, struct fat32_dir_entry *ent, u16 *long_name)
 {
     long_name[0] = 0;
     bool more_data = true;
@@ -342,7 +343,7 @@ void fat32_list_dir(FILE *dev, struct fat32_consts *c, struct fat32_dir_entry *d
     }
 }
 
-bool fat32_dirent_name_matches(fat32_dir_entry *ent, u16 *long_name, const char *target_name)
+bool fat32_dirent_name_matches(struct fat32_dir_entry *ent, u16 *long_name, const char *target_name)
 {
     if (!strcasecmp(shortname_expand(ent->name), target_name))
         return true;
@@ -350,7 +351,7 @@ bool fat32_dirent_name_matches(fat32_dir_entry *ent, u16 *long_name, const char 
     return strcasecmp(longname2ascii(long_name), target_name) == 0;
 }
 
-void fat32_follow_path(FILE *dev, struct fat32_consts *c, const char *_path, fat32_dir_entry *ent)
+void fat32_follow_path(FILE *dev, struct fat32_consts *c, const char *_path, struct fat32_dir_entry *ent)
 {
     char path_copy[LONGNAME_MAX_LEN];
     char *path;
@@ -412,11 +413,11 @@ void fat32_follow_path(FILE *dev, struct fat32_consts *c, const char *_path, fat
 int main(int argc, char *argv[])
 {
     FILE *dev;
-    mbr m;
+    struct mbr m;
     int part_id;
-    fat32_consts c;
+    struct fat32_consts c;
     const char *path;
-    fat32_dir_entry dir_entry;
+    struct fat32_dir_entry dir_entry;
 
     // Open device
 
@@ -439,7 +440,7 @@ int main(int argc, char *argv[])
         printf("uid: %08x\n", m.mbr_uid);
         printf("reserved: %04x\n", m.mbr_reserved_1bc);
         for (int i = 0; i < 4; i++) {
-            partition *p = m.mbr_partitions + i;
+            struct partition *p = m.mbr_partitions + i;
             printf("partition %d:\n", i);
             if (p->part_sectors == 0) {
                 printf("    (empty)\n");
@@ -483,7 +484,7 @@ int main(int argc, char *argv[])
         fat32_list_dir(dev, &c, &dir_entry);
     }
     else {
-        fat32_print_file(dev, &c, &dir_entry);
+        fat32_print_file_ent(dev, &c, &dir_entry);
     }
 
     return 0;
